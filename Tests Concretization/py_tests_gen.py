@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Generate Python step functions from a GraphWalker JSON model and abstract test path.
+Generate Python step functions and tests runner from a GraphWalker JSON model and abstract test path.
 """
 
 from __future__ import annotations
