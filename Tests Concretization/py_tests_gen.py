@@ -2,15 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-Generate Python step functions from a GraphWalker JSON model,
-with:
-1) properties.output -> assert generation in vertex functions
-2) actions -> global variable assignments translated to Python
+Generate Python step functions from a GraphWalker JSON model and abstract test path.
 """
 
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import hashlib
 import json
 import re
@@ -157,10 +155,6 @@ def _normalize_value_token(tok: str) -> str:
 def gw_expr_to_py(expr: str) -> str:
     """
     Convert a GW-ish expression into Python expression focusing on:
-    - global.xxx -> ctx.globals.get("xxx")
-    - $xxx -> ctx.globals.get("xxx")
-    - &&, ||, !==, ===
-    This is intentionally lightweight.
     """
     e = expr.strip()
 
@@ -379,8 +373,7 @@ def build_name_maps(models: List[Model]) -> Tuple[
 
 def collect_declared_globals(models: List[Model]) -> List[str]:
     """
-    Heuristically collect global vars that appear on LHS of actions
-    so you can see what's defined in the model. 
+    Heuristically collect global vars to see what's defined in the model. 
     """
     vars_set = set()
 
@@ -511,19 +504,186 @@ def load_models(json_path: str) -> List[Model]:
     return [Model.from_dict(m) for m in models_data]
 
 
+# ----------------------------
+# Test path -> runner generation
+# ----------------------------
+
+def load_gw_test_path(path_file: str) -> List[Dict[str, Any]]:
+    """
+    Supports:
+      1) Standard JSON: a list[...] or an object containing steps/path/elements
+      2) NDJSON/JSONL/TXT: one JSON object per line (GraphWalker verbose output)
+    Returns: list of step dicts.
+    """
+    p = Path(path_file)
+
+    text = p.read_text(encoding="utf-8").strip()
+    if not text:
+        return []
+
+    # 1) Try standard JSON first
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, list):
+            return obj
+        if isinstance(obj, dict):
+            for key in ("steps", "path", "elements"):
+                if key in obj and isinstance(obj[key], list):
+                    return obj[key]
+            # 有些工具外层包一层，比如 {"path":{"steps":[...]}}
+            if "path" in obj and isinstance(obj["path"], dict):
+                for key in ("steps", "elements"):
+                    if key in obj["path"] and isinstance(obj["path"][key], list):
+                        return obj["path"][key]
+            # 单个 step object
+            return [obj]
+    except json.JSONDecodeError:
+        pass
+
+    # 2) Fallback: NDJSON
+    steps: List[Dict[str, Any]] = []
+    for i, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            steps.append(json.loads(line))
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON at line {i}: {e}\n{line[:200]}")
+    return steps
+
+def generate_path_runner_module(
+    path_steps: list[dict],
+    *,
+    steps_module_filename: str,
+    runner_name: str = "run_gw_path",
+) -> str:
+    """Generate a Python script that replays a GW path by calling generated step functions.
+
+    The runner loads the generated steps module *by filename* (relative to the runner file)
+    using importlib, then executes functions in the exact order they appear in the path JSON.
+    """
+
+    # Keep only the minimal info we need in the runner.
+    compact = []
+    for s in path_steps:
+        if not isinstance(s, dict):
+            continue
+        compact.append(
+            {
+                # GraphWalker CLI verbose output uses currentElementID/currentElementName.
+                "id": (s.get("id") or s.get("currentElementID") or ""),
+                "name": (s.get("name") or s.get("currentElementName") or ""),
+                "modelName": (s.get("modelName") or s.get("model") or ""),
+            }
+        )
+
+    # Use json.dumps for safe embedding.
+    path_literal = json.dumps(compact, ensure_ascii=False, indent=4)
+
+    return f'''#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Auto-generated GraphWalker path runner.
+
+- Loads the generated steps module from: {steps_module_filename}
+- Replays the recorded path in-order (vertices + edges).
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+from typing import Any, Dict, List
+
+
+PATH: List[Dict[str, Any]] = {path_literal}
+
+
+def _load_steps_module():
+    here = os.path.dirname(os.path.abspath(__file__))
+    steps_path = os.path.join(here, {steps_module_filename!r})
+
+    spec = importlib.util.spec_from_file_location("gw_steps_generated", steps_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load steps module spec from: {{steps_path}}")
+
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+    return mod
+
+
+def {runner_name}(ctx=None):
+    steps = _load_steps_module()
+    if ctx is None:
+        ctx = steps.StepContext()
+
+    for i, step in enumerate(PATH):
+        sid = (step.get("id") or step.get("currentElementID") or "")
+        name = (step.get("name") or step.get("currentElementName") or "")
+
+        if sid in steps.VERTEX_ID_TO_FUNC:
+            steps.VERTEX_ID_TO_FUNC[sid](ctx)
+            continue
+
+        if sid in steps.EDGE_ID_TO_FUNC:
+            steps.EDGE_ID_TO_FUNC[sid](ctx)
+            continue
+
+        # Fallback: try name maps (useful if ids changed between model export & path export).
+        if name and name in steps.VERTEX_NAME_TO_FUNCS:
+            steps.VERTEX_NAME_TO_FUNCS[name][0](ctx)
+            continue
+
+        if name and name in steps.EDGE_NAME_TO_FUNCS:
+            steps.EDGE_NAME_TO_FUNCS[name][0](ctx)
+            continue
+
+        raise KeyError(
+            "Cannot resolve step at index {{i}}: "
+            f"id={{sid!r}}, name={{name!r}}, modelName={{(step.get('modelName') or step.get('model'))!r}}"
+        )
+
+    return ctx
+
+
+if __name__ == "__main__":
+    {runner_name}()
+'''
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate ASCII-safe Python steps from GW model JSON.")
     parser.add_argument("input", help="Path to GW model JSON")
     parser.add_argument("-o", "--output", default="gw_steps.py", help="Output Python module path")
+
+    # Optional: also generate a runner script from a GW-produced test path JSON
+    parser.add_argument("--path", dest="path_json", default=None, help="Path to a GW generated test path JSON (optional)")
+    parser.add_argument("--runner-out", default="gw_path_runner.py", help="Output runner script path (used with --path)")
+    parser.add_argument("--runner-fn", default="run_gw_path", help="Runner function name inside the generated runner script")
+
     args = parser.parse_args()
 
+    # 1) Generate steps module
     models = load_models(args.input)
     code = generate_steps_module(models)
 
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(code)
-
     print(f"Wrote: {args.output}")
+
+    # 2) Generate runner module if requested
+    if args.path_json:
+        steps_filename = Path(args.output).name
+        path_steps = load_gw_test_path(args.path_json)
+        runner_code = generate_path_runner_module(
+            path_steps,
+            steps_module_filename=steps_filename,
+            runner_name=args.runner_fn,
+        )
+
+        with open(args.runner_out, "w", encoding="utf-8") as f:
+            f.write(runner_code)
+        print(f"Wrote: {args.runner_out}")
 
 
 if __name__ == "__main__":
